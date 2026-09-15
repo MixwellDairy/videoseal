@@ -24,3 +24,6 @@ timm
 scipy
 ffmpeg-python
 av
+gradio
+requests
+imageio-ffmpeg
