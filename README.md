@@ -50,6 +50,19 @@
 - **December 2024**: Initial VideoSeal release with 96-bit baseline model
 
 
+## 🖥️ Web UI (Gradio)
+
+Launch the interactive Web UI for easy drag-and-drop image & video watermarking and detection:
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+Then open your browser at `http://localhost:7860`.
+
+---
+
 ## 🚀 Quick start
 
 ```python
