@@ -28,6 +28,45 @@ MODELS_CACHE = {}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def text_to_bits(text: str, nbits: int) -> list:
+    """Convert a text string to a list of binary bits (0s and 1s) padded or truncated to `nbits`."""
+    text_bytes = text.encode('utf-8')
+    bits = []
+    for b in text_bytes:
+        bits.extend([int(x) for x in f"{b:08b}"])
+    if len(bits) < nbits:
+        bits = (bits + [0] * nbits)[:nbits]
+    else:
+        bits = bits[:nbits]
+    return bits
+
+
+def bits_to_text(bits) -> str:
+    """Attempt to decode binary bits into a readable UTF-8 text string."""
+    if isinstance(bits, str):
+        bits_list = [int(b) for b in bits if b in ("0", "1")]
+    else:
+        bits_list = list(bits)
+
+    byte_list = []
+    for i in range(0, len(bits_list) - 7, 8):
+        byte_chunk = bits_list[i:i+8]
+        byte_val = 0
+        for b in byte_chunk:
+            byte_val = (byte_val << 1) | int(b)
+        if byte_val == 0:
+            break
+        byte_list.append(byte_val)
+
+    try:
+        decoded = bytes(byte_list).decode('utf-8', errors='ignore')
+        # Filter out non-printable ASCII/Unicode if corrupted
+        printable = "".join(c for c in decoded if c.isprintable())
+        return printable.strip('\x00')
+    except Exception:
+        return ""
+
+
 def read_video_file(video_path: str):
     """
     Read video and audio streams using PyAV or torchvision.io.read_video if available.
@@ -104,12 +143,13 @@ def embed_image(
     image: Image.Image,
     model_name: str,
     scaling_w: float,
-    use_custom_msg: bool,
+    msg_type: str,
+    secret_text: str,
     custom_msg_str: str,
 ):
     """Embed watermark into an image."""
     if image is None:
-        return None, "Please upload an image first."
+        return None, "Please upload an image first.", ""
 
     try:
         model = get_model(model_name)
@@ -118,18 +158,18 @@ def embed_image(
         nbits = get_model_nbits(model)
 
         # Handle message creation
-        if use_custom_msg and custom_msg_str.strip():
+        if msg_type == "Secret Text" and secret_text.strip():
+            msg_bits = text_to_bits(secret_text.strip(), nbits)
+        elif msg_type == "Binary Bits (0s and 1s)" and custom_msg_str.strip():
             msg_bits = [int(b) for b in custom_msg_str.strip() if b in ("0", "1")]
             if len(msg_bits) < nbits:
-                # Pad with zeros or truncate
                 msg_bits = (msg_bits + [0] * nbits)[:nbits]
             elif len(msg_bits) > nbits:
                 msg_bits = msg_bits[:nbits]
-            msg_tensor = torch.tensor([msg_bits], dtype=torch.float32, device=DEVICE)
         else:
             msg_bits = [random.choice([0, 1]) for _ in range(nbits)]
-            msg_tensor = torch.tensor([msg_bits], dtype=torch.float32, device=DEVICE)
 
+        msg_tensor = torch.tensor([msg_bits], dtype=torch.float32, device=DEVICE)
         msg_str = "".join(str(b) for b in msg_bits)
 
         # Convert PIL Image to Tensor [1, 3, H, W]
@@ -141,8 +181,12 @@ def embed_image(
         watermarked_tensor = outputs["imgs_w"][0].cpu()
         watermarked_pil = T.ToPILImage()(watermarked_tensor.clamp(0, 1))
 
-        info_text = f"Successfully watermarked with model '{model_name}'.\n" \
-                    f"Message ({len(msg_bits)} bits): {msg_str}"
+        decoded_text = bits_to_text(msg_bits)
+        info_text = f"Successfully watermarked image with model '{model_name}'.\n" \
+                    f"Message Capacity: {nbits} bits\n" \
+                    f"Binary Message: {msg_str}"
+        if decoded_text:
+            info_text += f"\nSecret Text: \"{decoded_text}\""
 
         return watermarked_pil, info_text, msg_str
     except Exception as e:
@@ -168,9 +212,18 @@ def detect_image(image: Image.Image, model_name: str):
 
         # Detection probability score if available
         det_score = torch.sigmoid(preds[0, 0]).item() if preds.shape[1] > 0 else None
-        score_text = f"\nDetection Score: {det_score:.4f}" if det_score is not None else ""
 
-        return f"Extracted Binary Message ({len(msg_bits)} bits):\n{msg_str}{score_text}"
+        # Determine watermark presence status
+        if det_score is not None:
+            is_detected = det_score >= 0.5
+            status_line = f"Watermark Detected: {'YES 🟢' if is_detected else 'NO 🔴'} (Confidence: {det_score * 100:.2f}%)"
+        else:
+            status_line = "Watermark Detection Complete."
+
+        secret_text = bits_to_text(msg_bits)
+        text_line = f"\nExtracted Secret Text: \"{secret_text}\"" if secret_text else "\nExtracted Secret Text: (No printable secret text found)"
+
+        return f"{status_line}\n{text_line}\n\nExtracted Binary Message ({len(msg_bits)} bits):\n{msg_str}"
     except Exception as e:
         return f"Error detecting watermark: {str(e)}"
 
@@ -182,6 +235,9 @@ def embed_video(
     model_name: str,
     scaling_w: float,
     watermark_audio: bool,
+    msg_type: str,
+    secret_text: str,
+    custom_msg_str: str,
 ):
     """Embed watermark into a video (and optionally its audio track)."""
     if video_path is None or not os.path.exists(video_path):
@@ -190,6 +246,21 @@ def embed_video(
     try:
         model = get_model(model_name)
         model.blender.scaling_w = float(scaling_w)
+        nbits = get_model_nbits(model)
+
+        # Handle message creation
+        if msg_type == "Secret Text" and secret_text.strip():
+            msg_bits = text_to_bits(secret_text.strip(), nbits)
+        elif msg_type == "Binary Bits (0s and 1s)" and custom_msg_str.strip():
+            msg_bits = [int(b) for b in custom_msg_str.strip() if b in ("0", "1")]
+            if len(msg_bits) < nbits:
+                msg_bits = (msg_bits + [0] * nbits)[:nbits]
+            elif len(msg_bits) > nbits:
+                msg_bits = msg_bits[:nbits]
+        else:
+            msg_bits = [random.choice([0, 1]) for _ in range(nbits)]
+
+        msg_tensor = torch.tensor([msg_bits], dtype=torch.float32, device=DEVICE)
 
         # Read video
         video, audio, info = read_video_file(video_path)
@@ -200,7 +271,7 @@ def embed_video(
         video = video.to(DEVICE)
 
         with torch.no_grad():
-            outputs = model.embed(video, is_video=True, lowres_attenuation=True)
+            outputs = model.embed(video, msgs=msg_tensor, is_video=True, lowres_attenuation=True)
 
         video_w = outputs["imgs_w"].cpu()
         video_msgs = outputs["msgs"][0].cpu().numpy().astype(int)
@@ -263,7 +334,10 @@ def embed_video(
         if watermark_audio and is_audioseal_installed and audio_msg_str:
             status_text += "\nAudio track watermarked with AudioSeal."
 
-        msg_display = f"Video Message ({len(v_msg_str)} bits):\n{v_msg_str}"
+        decoded_text = bits_to_text(video_msgs)
+        msg_display = f"Video Binary Message ({len(v_msg_str)} bits):\n{v_msg_str}"
+        if decoded_text:
+            msg_display += f"\n\nSecret Text: \"{decoded_text}\""
         if audio_msg_str:
             msg_display += f"\n\nAudio Message ({len(audio_msg_str)} bits):\n{audio_msg_str}"
 
@@ -284,12 +358,26 @@ def detect_video(video_path: str, model_name: str, detect_audio: bool):
         video = video.to(DEVICE)
 
         with torch.no_grad():
-            msg_extracted = model.extract_message(video)
+            detected = model.detect(video, is_video=True)
 
+        preds = detected["preds"]
+        det_score = torch.sigmoid(preds[:, 0]).mean().item() if preds.shape[1] > 0 else None
+
+        # Aggregate message across frames
+        msg_extracted = model.extract_message(video)
         v_bits = msg_extracted[0].cpu().numpy().astype(int)
         v_msg_str = "".join(str(b) for b in v_bits)
 
-        result_text = f"Extracted Video Message ({len(v_msg_str)} bits):\n{v_msg_str}\n"
+        if det_score is not None:
+            is_detected = det_score >= 0.5
+            status_line = f"Watermark Detected: {'YES 🟢' if is_detected else 'NO 🔴'} (Confidence: {det_score * 100:.2f}%)"
+        else:
+            status_line = "Watermark Detection Complete."
+
+        secret_text = bits_to_text(v_bits)
+        text_line = f"\nExtracted Secret Text: \"{secret_text}\"" if secret_text else "\nExtracted Secret Text: (No printable secret text found)"
+
+        result_text = f"{status_line}\n{text_line}\n\nExtracted Video Binary Message ({len(v_msg_str)} bits):\n{v_msg_str}\n"
 
         if detect_audio and "audio_fps" in info and is_audioseal_installed and audio.numel() > 0:
             sample_rate = info["audio_fps"]
@@ -322,7 +410,7 @@ def build_app():
     title = "🦭 VideoSeal Web UI"
     description = """
     **VideoSeal** provides state-of-the-art invisible watermarking for Images and Videos.
-    Choose a tab below to embed or detect watermarks easily.
+    You can hide secret text or binary bit messages inside images and videos, and verify watermark presence.
     """
 
     model_options = ["videoseal", "pixelseal", "chunkyseal"]
@@ -345,18 +433,29 @@ def build_app():
                             minimum=0.05, maximum=1.0, value=0.2, step=0.05, label="Watermark Strength (scaling_w)"
                         )
 
-                        use_custom_msg = gr.Checkbox(value=False, label="Specify Custom Binary Message")
-                        custom_msg_input = gr.Textbox(
+                        msg_type_img = gr.Radio(
+                            choices=["Random Binary Bits", "Secret Text", "Binary Bits (0s and 1s)"],
+                            value="Random Binary Bits",
+                            label="Message Type",
+                        )
+                        secret_text_img = gr.Textbox(
+                            label="Secret Text Message",
+                            placeholder="Type secret message to hide (e.g. MySecretPass123)...",
+                            visible=False,
+                        )
+                        custom_msg_img = gr.Textbox(
                             label="Custom Binary Message (e.g. 10101...)",
                             placeholder="Type 0s and 1s...",
                             visible=False,
                         )
 
-                        def toggle_custom_msg(val):
-                            return gr.update(visible=val)
+                        def update_msg_inputs_img(msg_type):
+                            return gr.update(visible=(msg_type == "Secret Text")), gr.update(visible=(msg_type == "Binary Bits (0s and 1s)"))
 
-                        use_custom_msg.change(
-                            fn=toggle_custom_msg, inputs=[use_custom_msg], outputs=[custom_msg_input]
+                        msg_type_img.change(
+                            fn=update_msg_inputs_img,
+                            inputs=[msg_type_img],
+                            outputs=[secret_text_img, custom_msg_img],
                         )
 
                         embed_img_btn = gr.Button("Embed Watermark", variant="primary")
@@ -368,14 +467,14 @@ def build_app():
 
                         embed_img_btn.click(
                             fn=embed_image,
-                            inputs=[img_input, model_select_img, strength_img, use_custom_msg, custom_msg_input],
-                            outputs=[img_output, img_status, custom_msg_input],
+                            inputs=[img_input, model_select_img, strength_img, msg_type_img, secret_text_img, custom_msg_img],
+                            outputs=[img_output, img_status, custom_msg_img],
                         )
 
                 gr.Markdown("---")
                 with gr.Row():
                     with gr.Column():
-                        gr.Markdown("### 2. Detect / Extract Watermark")
+                        gr.Markdown("### 2. Detect / Verify Watermark")
                         detect_img_input = gr.Image(type="pil", label="Watermarked Image to Detect")
                         detect_model_select_img = gr.Dropdown(
                             choices=model_options, value="videoseal", label="Detection Model"
@@ -383,8 +482,8 @@ def build_app():
                         detect_img_btn = gr.Button("Detect Watermark", variant="primary")
 
                     with gr.Column():
-                        gr.Markdown("### Extraction Results")
-                        detect_img_output = gr.Textbox(label="Extracted Watermark Results", lines=5, interactive=False)
+                        gr.Markdown("### Extraction & Detection Results")
+                        detect_img_output = gr.Textbox(label="Watermark Presence & Extracted Secret", lines=7, interactive=False)
 
                         detect_img_btn.click(
                             fn=detect_image,
@@ -410,24 +509,49 @@ def build_app():
                             interactive=is_audioseal_installed,
                         )
 
+                        msg_type_vid = gr.Radio(
+                            choices=["Random Binary Bits", "Secret Text", "Binary Bits (0s and 1s)"],
+                            value="Random Binary Bits",
+                            label="Message Type",
+                        )
+                        secret_text_vid = gr.Textbox(
+                            label="Secret Text Message",
+                            placeholder="Type secret message to hide (e.g. VideoSecretKey)...",
+                            visible=False,
+                        )
+                        custom_msg_vid = gr.Textbox(
+                            label="Custom Binary Message (e.g. 10101...)",
+                            placeholder="Type 0s and 1s...",
+                            visible=False,
+                        )
+
+                        def update_msg_inputs_vid(msg_type):
+                            return gr.update(visible=(msg_type == "Secret Text")), gr.update(visible=(msg_type == "Binary Bits (0s and 1s)"))
+
+                        msg_type_vid.change(
+                            fn=update_msg_inputs_vid,
+                            inputs=[msg_type_vid],
+                            outputs=[secret_text_vid, custom_msg_vid],
+                        )
+
                         embed_vid_btn = gr.Button("Embed Video Watermark", variant="primary")
 
                     with gr.Column():
                         gr.Markdown("### Watermarked Output")
                         video_output = gr.Video(label="Watermarked Video")
-                        vid_msg_output = gr.Textbox(label="Embedded Messages", lines=4, interactive=False)
+                        vid_msg_output = gr.Textbox(label="Embedded Messages & Secret Text", lines=5, interactive=False)
                         vid_status = gr.Textbox(label="Status", interactive=False)
 
                         embed_vid_btn.click(
                             fn=embed_video,
-                            inputs=[video_input, model_select_vid, strength_vid, wm_audio_chk],
+                            inputs=[video_input, model_select_vid, strength_vid, wm_audio_chk, msg_type_vid, secret_text_vid, custom_msg_vid],
                             outputs=[video_output, vid_msg_output, vid_status],
                         )
 
                 gr.Markdown("---")
                 with gr.Row():
                     with gr.Column():
-                        gr.Markdown("### 2. Detect Watermark in Video")
+                        gr.Markdown("### 2. Detect / Verify Watermark in Video")
                         detect_vid_input = gr.Video(label="Watermarked Video File")
                         detect_model_select_vid = gr.Dropdown(
                             choices=model_options, value="videoseal", label="Detection Model"
@@ -441,9 +565,9 @@ def build_app():
                         detect_vid_btn = gr.Button("Detect Video Watermark", variant="primary")
 
                     with gr.Column():
-                        gr.Markdown("### Extraction Results")
+                        gr.Markdown("### Extraction & Detection Results")
                         detect_vid_output = gr.Textbox(
-                            label="Extracted Watermark Results", lines=6, interactive=False
+                            label="Watermark Presence & Extracted Secret", lines=8, interactive=False
                         )
 
                         detect_vid_btn.click(
@@ -457,4 +581,4 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
-    app.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False, inbrowser=True)

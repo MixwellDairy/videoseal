@@ -50,9 +50,15 @@
 - **December 2024**: Initial VideoSeal release with 96-bit baseline model
 
 
-## 🖥️ Web UI (Gradio)
+## 🖥️ Web UI (Gradio) - Mac / Linux Quick Launch 🚀
 
-Launch the interactive Web UI for easy drag-and-drop image & video watermarking and detection:
+Launch the interactive Web UI with a single copy-paste command in your Mac Terminal (handles virtualenv, dependencies, server launch, and opens your browser automatically):
+
+```bash
+bash launch.sh
+```
+
+Alternatively, standard launch:
 
 ```bash
 pip install -r requirements.txt
